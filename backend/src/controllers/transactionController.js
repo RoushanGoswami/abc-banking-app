@@ -1,75 +1,124 @@
-const { executeTransaction } = require("../config/db");
-const crypto = require("crypto");
+const { pool } = require("../config/db");
 
-const createTransaction = async (req, res) => {
-  const { accountId, type, amount, description } = req.body;
-  const numericAmount = parseFloat(amount);
+// 1. Sub-2-Second Enterprise Customer Search (< 2 Second SLA)
+const searchAccounts = async (req, res) => {
+  const { query } = req.query;
+  const { role, branch_id, branchId } = req.user || {};
+  const currentBranchId = branchId || branch_id;
 
-  if (isNaN(numericAmount) || numericAmount <= 0) {
-    return res.status(400).json({ error: "Invalid transaction amount" });
+  if (!query || query.trim().length < 2) {
+    return res
+      .status(400)
+      .json({ message: "Search term must be at least 2 characters." });
   }
 
   try {
-    const transactionRecord = await executeTransaction(async (client) => {
-      // Lock account row FOR UPDATE to prevent race conditions
-      const accountRes = await client.query(
-        `SELECT id, branch_id, balance, status FROM accounts WHERE id = $1 FOR UPDATE`,
-        [accountId],
-      );
+    let branchFilter = "";
+    const params = [`%${query.trim()}%`];
 
-      if (accountRes.rows.length === 0) throw new Error("Account not found");
-      const account = accountRes.rows[0];
+    // Managers and Tellers only search within their own branch; ADMIN searches bank-wide
+    if (role !== "ADMIN" && currentBranchId) {
+      branchFilter = "AND a.branch_id = $2";
+      params.push(currentBranchId);
+    }
 
-      if (
-        req.user.role !== "ADMIN" &&
-        account.branch_id !== req.user.branch_id
-      ) {
-        throw new Error("Branch permission mismatch");
-      }
+    const searchQuery = `
+      SELECT 
+        a.account_number, a.account_type, a.balance, a.status,
+        c.first_name, c.last_name, c.phone, c.pan_number,
+        b.branch_name, b.ifsc_code
+      FROM accounts a
+      JOIN customers c ON a.customer_id = c.id
+      JOIN branches b ON a.branch_id = b.id
+      WHERE (
+        a.account_number ILIKE $1 OR
+        c.first_name ILIKE $1 OR
+        c.last_name ILIKE $1 OR
+        c.phone ILIKE $1 OR
+        c.pan_number ILIKE $1
+      )
+      ${branchFilter}
+      LIMIT 25
+    `;
 
-      if (account.status !== "ACTIVE") {
-        throw new Error(`Account is currently ${account.status}`);
-      }
-
-      const currentBalance = parseFloat(account.balance);
-      let newBalance = currentBalance;
-
-      if (["WITHDRAWAL", "FEE_DEBIT"].includes(type)) {
-        if (currentBalance < numericAmount)
-          throw new Error("Insufficient funds");
-        newBalance -= numericAmount;
-      } else if (["DEPOSIT", "INTEREST_CREDIT"].includes(type)) {
-        newBalance += numericAmount;
-      }
-
-      await client.query(`UPDATE accounts SET balance = $1 WHERE id = $2`, [
-        newBalance,
-        accountId,
-      ]);
-
-      const txRef = `TXN-${Date.now()}-${crypto.randomBytes(3).toString("hex").toUpperCase()}`;
-      const txnRes = await client.query(
-        `INSERT INTO transactions (transaction_reference, account_id, branch_id, user_id, type, amount, balance_after, description)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
-        [
-          txRef,
-          accountId,
-          account.branch_id,
-          req.user.id,
-          type,
-          numericAmount,
-          newBalance,
-          description,
-        ],
-      );
-
-      return txnRes.rows[0];
-    });
-
-    return res.status(201).json(transactionRecord);
-  } catch (error) {
-    return res.status(400).json({ error: error.message });
+    const result = await pool.query(searchQuery, params);
+    res.json({ count: result.rows.length, results: result.rows });
+  } catch (err) {
+    console.error("Search Error:", err);
+    res
+      .status(500)
+      .json({ message: "Error performing high-speed account search." });
   }
 };
 
-module.exports = { createTransaction };
+// 2. ACID Fund Transfer Engine (NEFT/RTGS Simulation)
+const transferFunds = async (req, res) => {
+  const { fromAccount, toAccount, amount } = req.body;
+  const numericAmount = Number(amount);
+
+  if (!fromAccount || !toAccount || !numericAmount || numericAmount <= 0) {
+    return res.status(400).json({ message: "Invalid transfer parameters." });
+  }
+
+  if (fromAccount === toAccount) {
+    return res
+      .status(400)
+      .json({ message: "Cannot transfer to the same account." });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // Lock both accounts in alphabetical order to prevent deadlocks
+    const accountsOrder = [fromAccount, toAccount].sort();
+    const acctQuery = `
+      SELECT id, account_number, balance, branch_id, status 
+      FROM accounts 
+      WHERE account_number = ANY($1) 
+      FOR UPDATE
+    `;
+    const acctRes = await client.query(acctQuery, [accountsOrder]);
+
+    if (acctRes.rows.length !== 2) {
+      await client.query("ROLLBACK");
+      return res
+        .status(404)
+        .json({ message: "One or both accounts not found." });
+    }
+
+    const source = acctRes.rows.find((r) => r.account_number === fromAccount);
+    const target = acctRes.rows.find((r) => r.account_number === toAccount);
+
+    if (Number(source.balance) < numericAmount) {
+      await client.query("ROLLBACK");
+      return res
+        .status(400)
+        .json({ message: "Insufficient funds in source account." });
+    }
+
+    await client.query(
+      "UPDATE accounts SET balance = balance - $1 WHERE account_number = $2",
+      [numericAmount, fromAccount],
+    );
+    await client.query(
+      "UPDATE accounts SET balance = balance + $1 WHERE account_number = $2",
+      [numericAmount, toAccount],
+    );
+
+    await client.query("COMMIT");
+    res.json({
+      message: "Fund transfer completed successfully.",
+      transfer: { fromAccount, toAccount, amount: numericAmount },
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("Transfer Error:", err);
+    res.status(500).json({ message: `Transfer failed: ${err.message}` });
+  } finally {
+    client.release();
+  }
+};
+
+module.exports = { searchAccounts, transferFunds };
+  

@@ -3,18 +3,72 @@ const cors = require("cors");
 require("dotenv").config();
 const { pool } = require("./config/db");
 
+// Import Modular Routers & Controllers
+const { exportBranchReportCSV } = require("./controllers/exportController");
+const authRoutes = require("./routes/authRoutes");
+const authMiddleware = require("./middleware/auth");
+const authenticate = authMiddleware.authenticate || authMiddleware.verifyToken;
+const {
+  createCustomerAccount,
+  getBranches,
+  createBranch,
+} = require("./controllers/enterpriseController");
+
+const {
+  createCustomerAccount,
+  getBranches,
+  createBranch,
+  updateBranch,
+  deleteBranch,
+} = require("./controllers/enterpriseController");
+
+const {
+  getDashboardMetrics,
+  getProfitAndLoss,
+} = require("./controllers/reportController");
+const {
+  searchAccounts,
+  transferFunds,
+} = require("./controllers/transactionController");
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 
 app.use(cors());
 app.use(express.json());
 
-// 1. Health Check Endpoint
+// 1. Register Authentication & Modular Routes
+app.use("/api/auth", authRoutes);
+
+// 2. Health Check Endpoint
 app.get("/health", (req, res) => {
   res.json({ status: "HEALTHY", timestamp: new Date().toISOString() });
 });
 
-// 2. Enterprise Customer & Account Lookup Endpoint (Multi-Branch)
+// ==========================================
+// --- NEW ENTERPRISE BANKING ENDPOINTS ---
+// ==========================================
+
+// 3. High-Speed Enterprise Customer Search (< 2 Second SLA)
+app.get("/api/search", authenticate, searchAccounts);
+
+// 4. ACID Fund Transfer Engine (NEFT/RTGS Simulation)
+app.post("/api/transactions/transfer", authenticate, transferFunds);
+
+// 5. Financial Dashboard & P&L Analytics
+app.get("/api/reports/dashboard", authenticate, getDashboardMetrics);
+app.get("/api/reports/pnl", authenticate, getProfitAndLoss);
+app.get("/api/reports/export", authenticate, exportBranchReportCSV);
+app.post("/api/accounts/create", authenticate, createCustomerAccount);
+app.get("/api/branches", authenticate, getBranches);
+app.post("/api/branches", authenticate, createBranch);
+app.put("/api/branches/:id", authenticate, updateBranch);
+app.delete("/api/branches/:id", authenticate, deleteBranch);
+// ==========================================
+// --- EXISTING TELLER OPERATIONS ---
+// ==========================================
+
+// 6. Enterprise Customer & Account Lookup Endpoint (Multi-Branch)
 app.get("/api/accounts/:accountNumber", async (req, res) => {
   const { accountNumber } = req.params;
   try {
@@ -44,7 +98,7 @@ app.get("/api/accounts/:accountNumber", async (req, res) => {
   }
 });
 
-// 3. ACID Teller Transaction Engine with Audit Logging
+// 7. ACID Teller Transaction Engine with Audit Logging (Deposit / Withdraw)
 app.post("/api/transactions", async (req, res) => {
   const {
     accountNumber,
